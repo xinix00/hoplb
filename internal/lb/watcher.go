@@ -67,9 +67,7 @@ func (w *Watcher) watchSSE(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if w.client.APIKey != "" {
-		req.Header.Set("X-API-Key", w.client.APIKey)
-	}
+	w.client.Sign(req, nil)
 
 	resp, err := (&http.Client{}).Do(req) // no timeout — SSE is long-lived
 	if err != nil {
