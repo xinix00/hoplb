@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"hoplb/internal/lb"
 	"hoplb/internal/metrics"
@@ -46,6 +47,11 @@ func main() {
 	httpServer := &http.Server{
 		Addr:    *listenAddr,
 		Handler: proxy,
+		// Slowloris guard only. Deliberately NO ReadTimeout (large/slow uploads
+		// must pass through to backends) and NO WriteTimeout (streaming/SSE
+		// responses must not be cut) — only headers must arrive promptly.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
@@ -61,8 +67,12 @@ func main() {
 	adminMux.Handle("/metrics", metrics.NewExporter(m))
 
 	adminServer := &http.Server{
-		Addr:    *adminAddr,
-		Handler: adminMux,
+		Addr:              *adminAddr,
+		Handler:           adminMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
