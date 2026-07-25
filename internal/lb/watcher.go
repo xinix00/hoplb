@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"hoplib"
+	"github.com/xinix00/hoplib"
 )
 
 // Watcher watches local hop agent for task changes

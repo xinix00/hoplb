@@ -1,7 +1,7 @@
 package lb
 
 import (
-	"hoplib"
+	"github.com/xinix00/hoplib"
 	"fmt"
 	"io"
 	"log"
