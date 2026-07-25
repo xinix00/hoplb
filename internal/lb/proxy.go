@@ -86,3 +86,11 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap exposes the underlying ResponseWriter so http.ResponseController (and
+// httputil.ReverseProxy) can reach its Flusher and Hijacker. Without this,
+// wrapping the writer hides those interfaces: streaming/SSE responses would be
+// buffered instead of flushed in real time, and WebSocket upgrades would fail.
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
