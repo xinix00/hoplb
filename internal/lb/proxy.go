@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"time"
 
-	"hoplb/internal/metrics"
+	"github.com/xinix00/hoplb/internal/metrics"
 )
 
 // Proxy is a reverse proxy that routes based on the route table and tracks metrics

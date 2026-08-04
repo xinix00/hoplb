@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"hoplb/internal/metrics"
+	"github.com/xinix00/hoplb/internal/metrics"
 )
 
 func BenchmarkRouteMatch(b *testing.B) {

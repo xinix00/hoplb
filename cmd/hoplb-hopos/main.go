@@ -28,11 +28,11 @@ import (
 	"strings"
 	"time"
 
-	"hop-os/metal/app/applib"
-	"hop-os/metal/app/applib/appnet"
+	"github.com/xinix00/HopOS/metal/app/applib"
+	"github.com/xinix00/HopOS/metal/app/applib/appnet"
 
-	"hoplb/internal/lb"
-	"hoplb/internal/metrics"
+	"github.com/xinix00/hoplb/internal/lb"
+	"github.com/xinix00/hoplb/internal/metrics"
 )
 
 var version = "dev" // -ldflags "-X main.version=vX.Y.Z"

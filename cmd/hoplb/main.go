@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"hoplb/internal/lb"
-	"hoplb/internal/metrics"
+	"github.com/xinix00/hoplb/internal/lb"
+	"github.com/xinix00/hoplb/internal/metrics"
 )
 
 func main() {
