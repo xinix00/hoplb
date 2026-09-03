@@ -28,8 +28,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xinix00/HopOS/metal/app/applib"
-	"github.com/xinix00/HopOS/metal/app/applib/appnet"
+	"github.com/xinix00/HopOS/metal/v2/app/applib"
+	"github.com/xinix00/HopOS/metal/v2/app/applib/appnet"
 
 	"github.com/xinix00/hoplb/internal/lb"
 	"github.com/xinix00/hoplb/internal/metrics"
