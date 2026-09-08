@@ -3,6 +3,7 @@ package lb
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -23,10 +24,10 @@ type Watcher struct {
 	tagFilter  string // e.g., "lb:haas" means only jobs with tag lb=haas
 
 	// Cached state for incremental updates
-	agentHosts map[string]string                        // agentID → hostname
-	jobs       map[string]*hoplib.Job                  // jobName → job
-	relevant   map[string]struct{}                      // job names that contribute routes
-	tasks      map[string]map[string][]*hoplib.Task    // jobName → agentID → tasks
+	agentHosts map[string]string                    // agentID → hostname
+	jobs       map[string]*hoplib.Job               // jobName → job
+	relevant   map[string]struct{}                  // job names that contribute routes
+	tasks      map[string]map[string][]*hoplib.Task // jobName → agentID → tasks
 }
 
 // NewWatcher creates a new watcher
@@ -96,6 +97,7 @@ func (w *Watcher) watchSSE(ctx context.Context) error {
 		<-debounce.C
 	}
 	pending := make(map[string]struct{})
+	pendingFull := false
 
 	for {
 		select {
@@ -106,38 +108,59 @@ func (w *Watcher) watchSSE(ctx context.Context) error {
 				return nil // stream closed
 			}
 			if strings.HasPrefix(line, "data:") {
-				job := hoplib.ParseJobFromSSE(line)
+				job, full := classifyEvent(line, w.relevant, w.jobs)
 				if job == "" {
 					continue
-				}
-				_, isRelevant := w.relevant[job]
-				_, isKnown := w.jobs[job]
-				if !isRelevant && isKnown {
-					continue // known irrelevant job, skip
 				}
 				if len(pending) == 0 {
 					debounce.Reset(500 * time.Millisecond)
 				}
 				pending[job] = struct{}{}
-			}
-		case <-debounce.C:
-			needFullSync := false
-			for job := range pending {
-				if _, known := w.jobs[job]; !known {
-					needFullSync = true
-					break
+				if full {
+					pendingFull = true
 				}
 			}
-			if needFullSync {
-				w.sync() // new job appeared, need full sync
+		case <-debounce.C:
+			if pendingFull {
+				w.sync() // definition changed or new job: re-read the job list
 			} else {
 				for job := range pending {
 					w.syncJob(job)
 				}
 			}
 			pending = make(map[string]struct{})
+			pendingFull = false
 		}
 	}
+}
+
+// classifyEvent decides what an SSE data line means for the route table.
+// It returns the job the event is about ("" = ignore) and whether a full
+// sync is needed. A job event ({"name":...}) means the DEFINITION changed —
+// tags included — so it always earns a full sync, even for a job we had
+// filed as irrelevant: that is exactly how a job becomes relevant (measured
+// 2026-09-08 on traqqr: an easylb→hoplb tag rename was ignored until a
+// restart). A task event ({"job":...}) only moves instances around, so it
+// can be skipped for known irrelevant jobs and handled per job otherwise.
+// An unknown job needs the job list too.
+func classifyEvent(line string, relevant map[string]struct{}, known map[string]*hoplib.Job) (job string, full bool) {
+	var ev struct {
+		Name string `json:"name"`
+		Job  string `json:"job"`
+	}
+	_ = json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &ev)
+	if ev.Name != "" {
+		return ev.Name, true // job event: definition (and tags) may have changed
+	}
+	if ev.Job == "" {
+		return "", false
+	}
+	_, isRelevant := relevant[ev.Job]
+	_, isKnown := known[ev.Job]
+	if !isRelevant && isKnown {
+		return "", false // known irrelevant job: nothing to route
+	}
+	return ev.Job, !isKnown
 }
 
 // sync does a full fetch of agents, jobs, and per-job task status for relevant jobs.
@@ -185,7 +208,7 @@ func (w *Watcher) sync() {
 func (w *Watcher) syncJob(jobName string) {
 	status, err := hoplib.Fetch[struct {
 		Agents       []hoplib.Agent            `json:"agents"`
-		TasksByAgent map[string][]*hoplib.Task  `json:"tasks_by_agent"`
+		TasksByAgent map[string][]*hoplib.Task `json:"tasks_by_agent"`
 	}](w.client, fmt.Sprintf("%s/v1/jobs/%s/status", w.agentAddr, jobName))
 	if err != nil {
 		log.Printf("Failed to fetch job status for %s: %v", jobName, err)
@@ -276,7 +299,13 @@ func (w *Watcher) buildRoutes() {
 
 	w.routeTable.Update(routes)
 	log.Printf("Updated routes: %d patterns, %d total backends",
-		len(routes), func() int { n := 0; for _, r := range routes { n += len(r.Backends) }; return n }())
+		len(routes), func() int {
+			n := 0
+			for _, r := range routes {
+				n += len(r.Backends)
+			}
+			return n
+		}())
 }
 
 // taskPort returns the named port (from job's "port" tag) or first available.
