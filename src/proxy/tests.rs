@@ -20,6 +20,8 @@ struct TestEnv {
     records: Vec<Record>,
     clock: Cell<u64>,
     errors: Vec<Error>,
+    /// Elke werker bezet: het antwoord zegt `Connection: close`.
+    crowded: bool,
 }
 
 impl TestEnv {
@@ -43,6 +45,7 @@ impl TestEnv {
             records: Vec::new(),
             clock: Cell::new(0),
             errors: Vec::new(),
+            crowded: false,
         }
     }
 }
@@ -76,9 +79,16 @@ impl Env for TestEnv {
     fn backend_error(&mut self, _host: &str, _addr: &str, err: Error) {
         self.errors.push(err);
     }
+
+    fn crowded(&self) -> bool {
+        self.crowded
+    }
 }
 
 fn run(client: &Pipe, env: &mut TestEnv, peer: &str) {
+    // De client blijft op zijn antwoord wachten; pas na zijn laatste
+    // verzoek sluit de proxy hem (de stilte tussen verzoeken verloopt).
+    client.linger();
     block_on(serve(client.clone(), peer, env)).unwrap();
     assert!(
         client.is_closed(),
@@ -201,6 +211,48 @@ fn keep_alive_carries_the_next_request_round_robin() {
     );
     // Zonder peer geen X-Forwarded-For.
     assert!(!b1.text().contains("X-Forwarded-For"));
+}
+
+#[test]
+fn a_crowded_proxy_closes_after_the_answer() {
+    let b1 = Pipe::new(&[OK]);
+    let b2 = Pipe::new(&[OK]);
+    let client = Pipe::new(&[
+        b"GET /1 HTTP/1.1\r\nHost: a.example.com\r\n\r\n",
+        b"GET /2 HTTP/1.1\r\nHost: a.example.com\r\n\r\n",
+    ]);
+    let mut env = TestEnv::new(
+        &[("a.example.com", &["10.0.0.1:80"])],
+        vec![b1.clone(), b2.clone()],
+    );
+    env.crowded = true;
+    run(&client, &mut env, "");
+    // Eén antwoord, met de sluiting erbij; het tweede verzoek wacht niet op
+    // de stilte van deze verbinding maar krijgt een verse werker.
+    let got = client.text();
+    assert!(got.contains("Connection: close\r\n"), "{got}");
+    assert_eq!(got.matches("HTTP/1.1 200").count(), 1, "{got}");
+    assert_eq!(env.dialed.len(), 1);
+}
+
+#[test]
+fn a_client_that_left_ends_the_relay_and_the_backend() {
+    // Een backend die een stroom begint en dan zwijgt; de client is na zijn
+    // verzoek al weg (EOF). De proxy ziet dat bij de eerste hap en stopt,
+    // in plaats van tot `backend_idle` op de backend te wachten.
+    let b1 = Pipe::new(&[
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        b"b\r\ndata: one\n\n\r\n",
+    ]);
+    let client = Pipe::new(&[b"GET /events HTTP/1.1\r\nHost: a.example.com\r\n\r\n"]);
+    let mut env = TestEnv::new(&[("a.example.com", &["10.0.0.1:80"])], vec![b1.clone()]);
+    let _ = block_on(serve(client.clone(), "", &mut env));
+    assert!(client.is_closed());
+    assert!(b1.is_closed(), "the backend goes down with the client");
+    // De kop ging nog weg; de eerste hap niet meer.
+    let got = client.text();
+    assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+    assert!(!got.contains("data: one"), "{got}");
 }
 
 #[test]

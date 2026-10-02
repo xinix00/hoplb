@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::time::Duration;
 
-use leanhttp::{AsyncRead, AsyncWrite};
+use leanhttp::{AsyncRead, AsyncWrite, IoError};
 
 use crate::error::{Error, Result, try_extend, try_push, try_string};
 
@@ -107,6 +107,36 @@ impl<C: AsyncRead> Reader<C> {
         // INVARIANT: de verbinding schreef hoogstens tail.len() bytes.
         self.end = self.end.saturating_add(n).min(self.buf.len());
         Ok(n)
+    }
+
+    /// Of de andere kant wegging: één kijkje op de leeskant onder `probe`.
+    ///
+    /// Een termijn die verloopt is een lezer die er nog is; bytes die hij
+    /// stuurde blijven in de buffer staan (een volgend verzoek op een
+    /// keep-alive-verbinding gaat niet verloren); einde of een andere fout
+    /// is een lezer die weg is. Een volle buffer is "aanwezig", want dan
+    /// kan er niets gelezen worden zonder verlies.
+    ///
+    /// Waarom: een stroom van een backend naar een client (SSE, een lange
+    /// download) merkt anders pas aan een mislukte schrijf dat de client
+    /// weg is, en op de netstack van HopOS faalt zo'n schrijf lang niet.
+    pub async fn peer_gone(&mut self, probe: Duration) -> bool
+    where
+        C: AsyncRead,
+    {
+        if self.end == self.buf.len() {
+            return false;
+        }
+        if self.conn.set_read_timeout(Some(probe)).is_err() {
+            return false;
+        }
+        let r = self.fill().await;
+        let _ = self.conn.set_read_timeout(None);
+        match r {
+            Ok(0) => true,
+            Ok(_) | Err(Error::Io(IoError::TimedOut) | Error::HeadTooLarge { .. }) => false,
+            Err(_) => true,
+        }
     }
 
     /// Zorgt dat een hele kop (tot en met de lege regel) gebufferd is en
@@ -424,6 +454,10 @@ pub enum Fault {
     Sink(Error),
 }
 
+/// Hoe vaak een kopie die zijn lezer in de gaten houdt ([`Copy::watch`])
+/// tijdens stilte van de bron naar die lezer kijkt.
+pub const WATCH_EVERY: Duration = Duration::from_secs(1);
+
 /// Hoe een body doorgaat.
 #[derive(Clone, Copy, Debug)]
 pub struct Copy {
@@ -437,6 +471,11 @@ pub struct Copy {
     pub read_idle: Option<Duration>,
     /// De termijn per schrijf naar het doel.
     pub write_timeout: Option<Duration>,
+    /// Houd de lezer van het doel in de gaten: vóór elke hap, en elke
+    /// [`WATCH_EVERY`] stilte van de bron, één kijkje van zo lang
+    /// ([`Reader::peer_gone`]). Is hij weg, dan stopt de kopie met
+    /// [`Fault::Sink`] en [`Error::Eof`]. `None` kijkt niet.
+    pub watch: Option<Duration>,
 }
 
 /// Zet een body van `from` naar `to` door, in happen van hoogstens
@@ -444,16 +483,17 @@ pub struct Copy {
 ///
 /// Chunked gaat ongewijzigd door (de chunk-koppen en de trailers ook), of
 /// uitgepakt als `dechunk`; zo is een stroom van een backend op de draad
-/// naar de client dezelfde stroom, hap voor hap.
+/// naar de client dezelfde stroom, hap voor hap. Het doel is een
+/// [`Reader`], zodat de kopie zijn lezer kan zien weggaan ([`Copy::watch`]).
 pub async fn copy_body<R, W>(
     from: &mut Reader<R>,
-    to: &mut W,
+    to: &mut Reader<W>,
     how: Copy,
     piece: &mut [u8],
 ) -> core::result::Result<u64, Fault>
 where
     R: AsyncRead,
-    W: AsyncWrite,
+    W: AsyncRead + AsyncWrite,
 {
     match how.framing {
         Framing::Empty => Ok(0),
@@ -466,49 +506,127 @@ where
 /// Zet de stiltetermijn van de bron opnieuw, vóór elke lees: een termijn
 /// van leanhttp is een deadline vanaf nu, en een lange upload mag duren
 /// zolang hij stroomt.
-fn arm_read<R: AsyncRead>(from: &mut Reader<R>, how: &Copy) -> core::result::Result<(), Fault> {
+fn arm_read<R: AsyncRead>(
+    from: &mut Reader<R>,
+    t: Option<Duration>,
+) -> core::result::Result<(), Fault> {
     from.get_mut()
-        .set_read_timeout(how.read_idle)
+        .set_read_timeout(t)
         .map_err(|e| Fault::Source(e.into()))
 }
 
-async fn put<W: AsyncWrite>(
-    to: &mut W,
+/// De termijn van de volgende lees van de bron, en of er dan nog een
+/// volgende komt: zonder [`Copy::watch`] de hele stilte in één keer, met
+/// hooguit [`WATCH_EVERY`] zodat de kopie tussendoor naar zijn lezer kijkt.
+fn slice(how: &Copy, waited: Duration) -> (Option<Duration>, bool) {
+    if how.watch.is_none() {
+        return (how.read_idle, false);
+    }
+    match how.read_idle {
+        None => (Some(WATCH_EVERY), true),
+        Some(idle) => {
+            let left = idle.saturating_sub(waited);
+            (Some(left.min(WATCH_EVERY)), left > WATCH_EVERY)
+        }
+    }
+}
+
+/// Eén hap van de bron in `buf`, met de lezer van `to` in de gaten.
+async fn read_piece<R: AsyncRead, W: AsyncRead + AsyncWrite>(
+    from: &mut Reader<R>,
+    to: &mut Reader<W>,
+    how: &Copy,
+    buf: &mut [u8],
+) -> core::result::Result<usize, Fault> {
+    let mut waited = Duration::ZERO;
+    loop {
+        let (t, more) = slice(how, waited);
+        arm_read(from, t)?;
+        match from.read_some(buf).await {
+            Err(Error::Io(IoError::TimedOut)) if more => {
+                waited = waited.saturating_add(t.unwrap_or(WATCH_EVERY));
+                look(to, how).await?;
+            }
+            r => return r.map_err(Fault::Source),
+        }
+    }
+}
+
+/// Eén regel van de bron (gebufferd, lengte terug), met de lezer van `to`
+/// in de gaten: tussen twee chunks van een SSE-stroom wacht de kopie hier.
+async fn read_line_watched<R: AsyncRead, W: AsyncRead + AsyncWrite>(
+    from: &mut Reader<R>,
+    to: &mut Reader<W>,
+    how: &Copy,
+) -> core::result::Result<usize, Fault> {
+    let mut waited = Duration::ZERO;
+    loop {
+        let (t, more) = slice(how, waited);
+        arm_read(from, t)?;
+        match from.read_line(MAX_LINE).await {
+            Err(Error::Io(IoError::TimedOut)) if more => {
+                waited = waited.saturating_add(t.unwrap_or(WATCH_EVERY));
+                look(to, how).await?;
+            }
+            r => return r.map_err(Fault::Source),
+        }
+    }
+}
+
+/// Kijkt of de lezer van `to` er nog is, als de kopie dat moet doen.
+async fn look<W: AsyncRead + AsyncWrite>(
+    to: &mut Reader<W>,
+    how: &Copy,
+) -> core::result::Result<(), Fault> {
+    if let Some(probe) = how.watch
+        && to.peer_gone(probe).await
+    {
+        return Err(Fault::Sink(Error::Eof));
+    }
+    Ok(())
+}
+
+async fn put<W: AsyncRead + AsyncWrite>(
+    to: &mut Reader<W>,
     how: &Copy,
     bytes: &[u8],
 ) -> core::result::Result<(), Fault> {
     if bytes.is_empty() {
         return Ok(());
     }
-    to.set_write_timeout(how.write_timeout)
+    look(to, how).await?;
+    to.get_mut()
+        .set_write_timeout(how.write_timeout)
         .map_err(|e| Fault::Sink(e.into()))?;
-    leanhttp::write_all(to, bytes)
+    leanhttp::write_all(to.get_mut(), bytes)
         .await
         .map_err(|e| Fault::Sink(e.into()))
 }
 
-async fn spill<W: AsyncWrite>(to: &mut W, how: &Copy) -> core::result::Result<(), Fault> {
+async fn spill<W: AsyncRead + AsyncWrite>(
+    to: &mut Reader<W>,
+    how: &Copy,
+) -> core::result::Result<(), Fault> {
     if how.flush {
-        leanhttp::flush(to)
+        leanhttp::flush(to.get_mut())
             .await
             .map_err(|e| Fault::Sink(e.into()))?;
     }
     Ok(())
 }
 
-async fn copy_exact<R: AsyncRead, W: AsyncWrite>(
+async fn copy_exact<R: AsyncRead, W: AsyncRead + AsyncWrite>(
     from: &mut Reader<R>,
-    to: &mut W,
+    to: &mut Reader<W>,
     n: u64,
     how: &Copy,
     piece: &mut [u8],
 ) -> core::result::Result<u64, Fault> {
     let mut left = n;
     while left > 0 {
-        arm_read(from, how)?;
         let want = piece.len().min(usize::try_from(left).unwrap_or(usize::MAX));
         let buf = piece.get_mut(..want).unwrap_or(&mut []);
-        let got = from.read_some(buf).await.map_err(Fault::Source)?;
+        let got = read_piece(from, to, how, buf).await?;
         if got == 0 {
             return Err(Fault::Source(Error::UnexpectedEof));
         }
@@ -519,16 +637,15 @@ async fn copy_exact<R: AsyncRead, W: AsyncWrite>(
     Ok(n)
 }
 
-async fn copy_to_eof<R: AsyncRead, W: AsyncWrite>(
+async fn copy_to_eof<R: AsyncRead, W: AsyncRead + AsyncWrite>(
     from: &mut Reader<R>,
-    to: &mut W,
+    to: &mut Reader<W>,
     how: &Copy,
     piece: &mut [u8],
 ) -> core::result::Result<u64, Fault> {
     let mut total = 0u64;
     loop {
-        arm_read(from, how)?;
-        let got = from.read_some(piece).await.map_err(Fault::Source)?;
+        let got = read_piece(from, to, how, piece).await?;
         if got == 0 {
             return Ok(total);
         }
@@ -538,16 +655,15 @@ async fn copy_to_eof<R: AsyncRead, W: AsyncWrite>(
     }
 }
 
-async fn copy_chunked<R: AsyncRead, W: AsyncWrite>(
+async fn copy_chunked<R: AsyncRead, W: AsyncRead + AsyncWrite>(
     from: &mut Reader<R>,
-    to: &mut W,
+    to: &mut Reader<W>,
     how: &Copy,
     piece: &mut [u8],
 ) -> core::result::Result<u64, Fault> {
     let mut total = 0u64;
     loop {
-        arm_read(from, how)?;
-        let n = from.read_line(MAX_LINE).await.map_err(Fault::Source)?;
+        let n = read_line_watched(from, to, how).await?;
         let size = chunk_size(from.buffered().get(..n).unwrap_or(&[])).map_err(Fault::Source)?;
         if how.dechunk {
             from.consume(n);
@@ -561,10 +677,9 @@ async fn copy_chunked<R: AsyncRead, W: AsyncWrite>(
         }
         let mut left = size;
         while left > 0 {
-            arm_read(from, how)?;
             let want = piece.len().min(usize::try_from(left).unwrap_or(usize::MAX));
             let buf = piece.get_mut(..want).unwrap_or(&mut []);
-            let got = from.read_some(buf).await.map_err(Fault::Source)?;
+            let got = read_piece(from, to, how, buf).await?;
             if got == 0 {
                 return Err(Fault::Source(Error::UnexpectedEof));
             }
@@ -573,8 +688,7 @@ async fn copy_chunked<R: AsyncRead, W: AsyncWrite>(
         }
         total = total.saturating_add(size);
         // De CRLF na de data.
-        arm_read(from, how)?;
-        let n = from.read_line(MAX_LINE).await.map_err(Fault::Source)?;
+        let n = read_line_watched(from, to, how).await?;
         if from.buffered().get(..n) != Some(b"\r\n") {
             return Err(Fault::Source(Error::BadResponse(
                 "chunk not followed by CRLF",
@@ -589,16 +703,15 @@ async fn copy_chunked<R: AsyncRead, W: AsyncWrite>(
 }
 
 /// De trailers na de nul-chunk, tot en met de lege regel.
-async fn copy_trailers<R: AsyncRead, W: AsyncWrite>(
+async fn copy_trailers<R: AsyncRead, W: AsyncRead + AsyncWrite>(
     from: &mut Reader<R>,
-    to: &mut W,
+    to: &mut Reader<W>,
     how: &Copy,
     piece: &mut [u8],
 ) -> core::result::Result<(), Fault> {
     let mut budget = BUF_SIZE;
     loop {
-        arm_read(from, how)?;
-        let n = from.read_line(MAX_LINE).await.map_err(Fault::Source)?;
+        let n = read_line_watched(from, to, how).await?;
         budget = budget
             .checked_sub(n)
             .ok_or(Fault::Source(Error::HeadTooLarge { limit: BUF_SIZE }))?;
@@ -621,9 +734,9 @@ async fn copy_trailers<R: AsyncRead, W: AsyncWrite>(
 /// Zet de eerste `n` gebufferde bytes van `from` ongewijzigd door, in
 /// happen van `piece` (de regel leeft in de buffer van `from`, en `to` is
 /// een andere verbinding).
-async fn pass_line<R: AsyncRead, W: AsyncWrite>(
+async fn pass_line<R: AsyncRead, W: AsyncRead + AsyncWrite>(
     from: &mut Reader<R>,
-    to: &mut W,
+    to: &mut Reader<W>,
     how: &Copy,
     piece: &mut [u8],
     n: usize,

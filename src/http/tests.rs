@@ -137,6 +137,7 @@ fn how(framing: Framing, dechunk: bool, flush: bool) -> Copy {
         flush,
         read_idle: None,
         write_timeout: None,
+        watch: None,
     }
 }
 
@@ -144,7 +145,7 @@ fn how(framing: Framing, dechunk: bool, flush: bool) -> Copy {
 fn a_length_body_goes_through_in_pieces() {
     let mut from = Reader::new(Pipe::new(&[b"0123456789", b"abcdef", b"NEXT"])).unwrap();
     let to = Pipe::new(&[]);
-    let mut sink = to.clone();
+    let mut sink = Reader::new(to.clone()).unwrap();
     let mut piece = [0u8; 4];
     let n = block_on(copy_body(
         &mut from,
@@ -168,7 +169,7 @@ fn a_length_body_goes_through_in_pieces() {
 #[test]
 fn a_short_length_body_is_the_source_failing() {
     let mut from = Reader::new(Pipe::new(&[b"abc"])).unwrap();
-    let mut to = Pipe::new(&[]);
+    let mut to = Reader::new(Pipe::new(&[])).unwrap();
     let mut piece = [0u8; 16];
     let r = block_on(copy_body(
         &mut from,
@@ -184,7 +185,7 @@ fn chunked_passes_through_verbatim_with_trailers() {
     let wire: &[u8] = b"4\r\nWiki\r\n5;x=y\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT";
     let mut from = Reader::new(Pipe::new(&[&wire[..7], &wire[7..20], &wire[20..]])).unwrap();
     let to = Pipe::new(&[]);
-    let mut sink = to.clone();
+    let mut sink = Reader::new(to.clone()).unwrap();
     let mut piece = [0u8; 3];
     let n = block_on(copy_body(
         &mut from,
@@ -207,7 +208,7 @@ fn chunked_can_be_unpacked_for_an_old_client() {
     ]))
     .unwrap();
     let to = Pipe::new(&[]);
-    let mut sink = to.clone();
+    let mut sink = Reader::new(to.clone()).unwrap();
     let mut piece = [0u8; 64];
     block_on(copy_body(
         &mut from,
@@ -228,7 +229,7 @@ fn crooked_chunks_are_refused() {
         b"11111111111111111\r\n",
     ] {
         let mut from = Reader::new(Pipe::new(&[bad])).unwrap();
-        let mut to = Pipe::new(&[]);
+        let mut to = Reader::new(Pipe::new(&[])).unwrap();
         let mut piece = [0u8; 64];
         let r = block_on(copy_body(
             &mut from,
@@ -244,7 +245,7 @@ fn crooked_chunks_are_refused() {
 fn eof_framing_reads_until_the_end() {
     let mut from = Reader::new(Pipe::new(&[b"abc", b"def"])).unwrap();
     let to = Pipe::new(&[]);
-    let mut sink = to.clone();
+    let mut sink = Reader::new(to.clone()).unwrap();
     let mut piece = [0u8; 64];
     let n = block_on(copy_body(
         &mut from,
@@ -259,8 +260,9 @@ fn eof_framing_reads_until_the_end() {
 #[test]
 fn a_sink_that_fails_is_the_sink() {
     let mut from = Reader::new(Pipe::new(&[b"abc"])).unwrap();
-    let mut to = Pipe::new(&[]);
-    to.0.borrow_mut().closed = true;
+    let pipe = Pipe::new(&[]);
+    pipe.0.borrow_mut().closed = true;
+    let mut to = Reader::new(pipe).unwrap();
     let mut piece = [0u8; 64];
     let r = block_on(copy_body(
         &mut from,
@@ -269,4 +271,40 @@ fn a_sink_that_fails_is_the_sink() {
         &mut piece,
     ));
     assert!(matches!(r, Err(Fault::Sink(_))), "{r:?}");
+}
+
+#[test]
+fn a_watched_copy_stops_when_the_reader_left() {
+    let mut from = Reader::new(Pipe::new(&[
+        b"4\r\nWiki\r\n",
+        b"5\r\npedia\r\n",
+        b"0\r\n\r\n",
+    ]))
+    .unwrap();
+    // Een lezer die al weg is: EOF op zijn leeskant.
+    let to = Pipe::new(&[]);
+    let mut sink = Reader::new(to.clone()).unwrap();
+    let mut piece = [0u8; 16];
+    let mut how = how(Framing::Chunked, false, true);
+    how.watch = Some(Duration::from_millis(1));
+    let r = block_on(copy_body(&mut from, &mut sink, how, &mut piece));
+    assert_eq!(r, Err(Fault::Sink(Error::Eof)));
+    assert_eq!(to.text(), "", "nothing goes to a reader that left");
+}
+
+#[test]
+fn a_watched_copy_keeps_what_the_reader_sent() {
+    let mut from = Reader::new(Pipe::new(&[b"hello"])).unwrap();
+    // Een lezer die er is en alvast zijn volgende verzoek stuurt.
+    let to = Pipe::new(&[b"GET /next HTTP/1.1\r\n"]);
+    to.linger();
+    let mut sink = Reader::new(to.clone()).unwrap();
+    let mut piece = [0u8; 16];
+    let mut how = how(Framing::Length(5), false, true);
+    how.watch = Some(Duration::from_millis(1));
+    let n = block_on(copy_body(&mut from, &mut sink, how, &mut piece)).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(to.text(), "hello");
+    // Wat de sondering las, staat klaar voor het volgende verzoek.
+    assert_eq!(sink.buffered(), b"GET /next HTTP/1.1\r\n");
 }

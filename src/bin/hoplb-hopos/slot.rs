@@ -237,6 +237,9 @@ struct SlotEnv {
     /// `HOPLB_VERBOSE=1`: één logregel per verzoek (Go logde er altijd één;
     /// hier alleen op verzoek, want de console van de kern is gedeeld).
     verbose: bool,
+    /// Welke verkeerswerker een verbinding heeft; allemaal is vol
+    /// (`Env::crowded`).
+    busy: &'static [Cell<bool>; WORKERS],
 }
 
 impl Env for SlotEnv {
@@ -245,6 +248,10 @@ impl Env for SlotEnv {
     fn pick(&mut self, host: &str) -> Pick {
         // Eén lening, binnen dit statement.
         ROUTES.borrow().pick(host)
+    }
+
+    fn crowded(&self) -> bool {
+        self.busy.iter().all(Cell::get)
     }
 
     async fn dial(&mut self, addr: &str) -> hoplb::Result<TcpConn> {
@@ -314,7 +321,11 @@ async fn traffic_worker(
     exec: &'static Exec,
     verbose: bool,
 ) {
-    let mut env = SlotEnv { exec, verbose };
+    let mut env = SlotEnv {
+        exec,
+        verbose,
+        busy: TRAFFIC_BUSY.get(),
+    };
     loop {
         let stream = rx.recv().await;
         let mut peer = [0u8; 15];

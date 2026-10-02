@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::time::Duration;
 
-use leanhttp::{AsyncRead, AsyncWrite, Conn};
+use leanhttp::{AsyncRead, AsyncWrite, Conn, IoError};
 
 use crate::error::{Error, Result, try_string};
 use crate::http::{
@@ -61,6 +61,13 @@ pub struct Limits {
     /// geen; een SSE-stroom zwijgt lang, maar een backend die tien minuten
     /// niets zegt, houdt een werker niet voor altijd vast.
     pub backend_idle: Duration,
+    /// Eén kijkje op de leeskant van de client terwijl het antwoord loopt
+    /// ([`http::Reader::peer_gone`]): vóór elke hap en elke
+    /// [`http::WATCH_EVERY`] stilte van de backend. Een client die wegging
+    /// maakt het antwoord af en geeft de werker terug, in plaats van te
+    /// wachten op een mislukte schrijf (op HopOS: lang niet) of op
+    /// `backend_idle`.
+    pub probe: Duration,
 }
 
 impl Default for Limits {
@@ -71,6 +78,7 @@ impl Default for Limits {
             body_idle: Duration::from_secs(60),
             write: Duration::from_secs(30),
             backend_idle: Duration::from_secs(600),
+            probe: Duration::from_millis(1),
         }
     }
 }
@@ -100,6 +108,16 @@ pub trait Env {
     /// De termijnen.
     fn limits(&self) -> Limits {
         Limits::default()
+    }
+
+    /// Of elke werker van de pool een verbinding heeft. Dan zegt het
+    /// antwoord `Connection: close`: de volgende verbinding wacht op het
+    /// einde van dit verzoek, niet op de stilte ([`Limits::idle`]) van een
+    /// keep-alive-client die misschien niets meer vraagt. Een browser doet
+    /// zijn parallelle verzoeken op eigen verbindingen; zonder dit wachtte
+    /// de derde op de eerste.
+    fn crowded(&self) -> bool {
+        false
     }
 }
 
@@ -321,23 +339,26 @@ async fn forward<C: Conn, B: Conn, E: Env>(
             flush: false,
             read_idle: Some(limits.body_idle),
             write_timeout: Some(limits.write),
+            watch: None,
         };
-        http::copy_body(client, backend.get_mut(), how, piece)
+        http::copy_body(client, backend, how, piece)
             .await
             .map_err(|f| match f {
                 Fault::Source(_) => Stage::Client,
                 Fault::Sink(e) => Stage::Before(e),
             })?;
     }
-    let resp = read_response(backend, limits.backend_idle)
-        .await
-        .map_err(Stage::Before)?;
+    let resp = read_response(backend, client, &limits).await?;
     let rframing =
         http::response_framing(&req.method, resp.status, &resp.headers).map_err(Stage::Before)?;
     // Een HTTP/1.0-client kent geen chunked: uitpakken, en dan sluit het
     // einde van de verbinding de body af.
     let dechunk = rframing == Framing::Chunked && req.minor == 0;
-    let keep = !wants_close(req) && req.minor == 1 && rframing != Framing::Eof && !dechunk;
+    let keep = !wants_close(req)
+        && req.minor == 1
+        && rframing != Framing::Eof
+        && !dechunk
+        && !env.crowded();
     let head = response_head(&resp, rframing, dechunk, keep).map_err(|_| Stage::Client)?;
     write(client.get_mut(), &head, limits.write)
         .await
@@ -348,8 +369,9 @@ async fn forward<C: Conn, B: Conn, E: Env>(
         flush: true,
         read_idle: Some(limits.backend_idle),
         write_timeout: Some(limits.write),
+        watch: Some(limits.probe),
     };
-    match http::copy_body(backend, client.get_mut(), how, piece).await {
+    match http::copy_body(backend, client, how, piece).await {
         Ok(_) => {
             leanhttp::flush(client.get_mut())
                 .await
@@ -362,22 +384,43 @@ async fn forward<C: Conn, B: Conn, E: Env>(
 
 /// Leest de kop van het antwoord; tussenantwoorden (1xx) vallen weg, want
 /// de client kreeg zijn `100 Continue` al van ons en `Upgrade` gaat niet door.
-async fn read_response<B: Conn>(backend: &mut Reader<B>, idle: Duration) -> Result<ResponseHead> {
+/// De kop van het antwoord van de backend, tot de eerste eindstatus. De
+/// wacht op een trage backend gaat in stukken van [`http::WATCH_EVERY`],
+/// met tussendoor een kijkje of de client er nog is: een client die
+/// wegging is [`Stage::Client`], en de backend gaat mee dicht.
+async fn read_response<B: Conn, C: Conn>(
+    backend: &mut Reader<B>,
+    client: &mut Reader<C>,
+    limits: &Limits,
+) -> core::result::Result<ResponseHead, Stage> {
+    let mut waited = Duration::ZERO;
     loop {
-        backend.get_mut().set_read_timeout(Some(idle))?;
+        let left = limits.backend_idle.saturating_sub(waited);
+        let slice = left.min(http::WATCH_EVERY);
+        backend
+            .get_mut()
+            .set_read_timeout(Some(slice))
+            .map_err(|e| Stage::Before(e.into()))?;
         let n = match backend.read_head().await {
             Ok(n) => n,
-            Err(Error::Eof) => return Err(Error::UnexpectedEof),
-            Err(e) => return Err(e),
+            Err(Error::Io(IoError::TimedOut)) if left > http::WATCH_EVERY => {
+                waited = waited.saturating_add(slice);
+                if client.peer_gone(limits.probe).await {
+                    return Err(Stage::Client);
+                }
+                continue;
+            }
+            Err(Error::Eof) => return Err(Stage::Before(Error::UnexpectedEof)),
+            Err(e) => return Err(Stage::Before(e)),
         };
         let head = http::parse_response(backend.buffered().get(..n).unwrap_or(&[]));
         backend.consume(n);
-        let head = head?;
+        let head = head.map_err(Stage::Before)?;
         if head.status >= 200 {
             return Ok(head);
         }
         if head.status == 101 {
-            return Err(Error::Unsupported("protocol upgrade"));
+            return Err(Stage::Before(Error::Unsupported("protocol upgrade")));
         }
     }
 }

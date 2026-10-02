@@ -10,6 +10,7 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use std::time::Instant;
 
+use core::time::Duration;
 use leanhttp::{AsyncRead, AsyncWrite, Close, IoError};
 
 /// Draait `f` `n` keer, drukt de meetregel af en geeft ns per keer.
@@ -75,6 +76,12 @@ pub(crate) struct Inner {
     pub(crate) closed: bool,
     /// Faalt de volgende lees als de happen op zijn (in plaats van EOF)?
     pub(crate) reset_at_end: bool,
+    /// Blijft de andere kant na zijn happen aanwezig? Dan verloopt een lees
+    /// met termijn (`TimedOut`) in plaats van EOF te geven: een client die
+    /// op zijn antwoord wacht.
+    pub(crate) linger: bool,
+    /// Of er een leestermijn gezet is (de sondering van een kopie).
+    pub(crate) timed: bool,
 }
 
 /// Een verbinding in het geheugen: leest uit een vast script van happen,
@@ -106,6 +113,12 @@ impl Pipe {
     pub(crate) fn is_closed(&self) -> bool {
         self.0.borrow().closed
     }
+
+    /// Een client die na zijn happen blijft wachten op zijn antwoord: een
+    /// lees met termijn verloopt dan, in plaats van EOF.
+    pub(crate) fn linger(&self) {
+        self.0.borrow_mut().linger = true;
+    }
 }
 
 impl AsyncRead for Pipe {
@@ -118,6 +131,9 @@ impl AsyncRead for Pipe {
         let Some(chunk) = p.input.first() else {
             if p.reset_at_end {
                 return Poll::Ready(Err(IoError::Reset));
+            }
+            if p.linger && p.timed {
+                return Poll::Ready(Err(IoError::TimedOut));
             }
             p.ops.push(Op::Read(0));
             return Poll::Ready(Ok(0));
@@ -133,6 +149,11 @@ impl AsyncRead for Pipe {
         }
         p.ops.push(Op::Read(n));
         Poll::Ready(Ok(n))
+    }
+
+    fn set_read_timeout(&mut self, t: Option<Duration>) -> Result<(), IoError> {
+        self.0.borrow_mut().timed = t.is_some();
+        Ok(())
     }
 }
 

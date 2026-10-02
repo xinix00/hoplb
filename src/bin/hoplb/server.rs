@@ -6,7 +6,9 @@
 //! een meting naar de eigenaar.
 
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -46,12 +48,14 @@ pub(crate) fn spawn_traffic(
     listener: &TcpListener,
     owner: &SyncSender<Msg>,
 ) -> std::io::Result<()> {
+    let busy = Arc::new(AtomicUsize::new(0));
     for i in 0..WORKERS {
         let l = listener.try_clone()?;
         let owner = owner.clone();
+        let busy = busy.clone();
         std::thread::Builder::new()
             .name(format!("traffic-{i}"))
-            .spawn(move || traffic(&l, owner))?;
+            .spawn(move || traffic(&l, owner, busy))?;
     }
     Ok(())
 }
@@ -74,6 +78,9 @@ struct HostEnv {
     routes: RouteTable,
     generation: u64,
     epoch: Instant,
+    /// Hoeveel verkeersthreads een verbinding hebben; [`WORKERS`] is vol
+    /// (`Env::crowded`).
+    busy: Arc<AtomicUsize>,
 }
 
 impl HostEnv {
@@ -139,6 +146,10 @@ impl Env for HostEnv {
     fn backend_error(&mut self, host: &str, addr: &str, err: Error) {
         log!("Proxy error for {host} -> {addr}: {err}");
     }
+
+    fn crowded(&self) -> bool {
+        self.busy.load(Ordering::Acquire) >= WORKERS
+    }
 }
 
 fn io_error(e: &std::io::Error) -> IoError {
@@ -151,12 +162,13 @@ fn io_error(e: &std::io::Error) -> IoError {
     }
 }
 
-fn traffic(l: &TcpListener, owner: SyncSender<Msg>) {
+fn traffic(l: &TcpListener, owner: SyncSender<Msg>, busy: Arc<AtomicUsize>) {
     let mut env = HostEnv {
         owner,
         routes: RouteTable::new(),
         generation: u64::MAX,
         epoch: Instant::now(),
+        busy,
     };
     loop {
         let (stream, peer) = match l.accept() {
@@ -170,9 +182,11 @@ fn traffic(l: &TcpListener, owner: SyncSender<Msg>) {
         let _ = stream.set_nodelay(true);
         let ip = peer.ip().to_string();
         let conn = StdConn::new(stream, Some(SOCKET_IDLE));
+        env.busy.fetch_add(1, Ordering::AcqRel);
         // Een verbinding die eindigt met een termijn of een reset is een
         // client die wegging; geen logregel waard.
         let _ = block_on(proxy::serve(conn, &ip, &mut env));
+        env.busy.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
