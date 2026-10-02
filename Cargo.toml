@@ -48,16 +48,16 @@ hopos = ["dep:applib", "dep:sync", "hoplib/hopos"]
 [dependencies]
 # HTTP/1.1 (PORT.md §2.1): de traits waar de proxy over loopt, en de server
 # van de admin-poort. Een tag, nooit een pad: lean is een eigen repo.
-leanhttp = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.1" }
+leanhttp = { git = "https://github.com/xinix00/lean.git", tag = "v3.1.3" }
 # De gedeelde client van Hop (xinix00/hoplib): de kern leest er de jobs,
 # taken en gebeurtenissen mee (sans-I/O), de features kiezen het transport.
-hoplib = { git = "https://github.com/xinix00/hoplib.git", tag = "v3.0.0" }
+hoplib = { git = "https://github.com/xinix00/hoplib.git", tag = "v3.0.1" }
 # De host-kant van het net (std-sockets als leanhttp-verbinding, block_on,
 # de HTTP-client), dezelfde tag als Hop zelf.
-hostnet = { git = "https://github.com/xinix00/hop.git", tag = "v3.0.0-alpha.10", optional = true }
+hostnet = { git = "https://github.com/xinix00/hop.git", tag = "v3.0.0", optional = true }
 # De app-runtime van HopOS: executor, netstack, `TcpConn`-brug voor leanhttp.
-applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.0-alpha.10", features = ["http"], optional = true }
-sync = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.0-alpha.10", optional = true }
+applib = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.0", features = ["http"], optional = true }
+sync = { git = "https://github.com/xinix00/HopOS.git", tag = "v3.0.0", optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -158,7 +158,7 @@ deletes welcome and checks that the SSE stream takes the route away.
 The Go generation lives in `OLD/` and is the specification: every Go test is
 here under its own name, every Go benchmark is a test that prints a line
 `bench <name>: <ns> ns/op`. Dependencies come from git tags only (lean
-v3.1.1, hop v3.0.0-alpha.10, HopOS v3.0.0-alpha.10, hoplib v3.0.0), never
+v3.1.3, hop v3.0.0, HopOS v3.0.0, hoplib v3.0.1), never
 from a path across repositories.
 
 ## License
